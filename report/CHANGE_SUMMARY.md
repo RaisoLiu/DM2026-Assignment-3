@@ -43,6 +43,8 @@
 - Added LaTeX source `report/report.tex` and compiled the final PDF
   `report/DM_asg3_413551030.pdf` with `pdflatex`.
 - Added `report/PI_REVIEW.md` as a review checklist for final submission.
+- Published the reproducible code/report repository at
+  `https://github.com/RaisoLiu/DM2026-Assignment-3`.
 
 ## Final Verification
 
