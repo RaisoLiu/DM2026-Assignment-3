@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/raw/
+data/processed/
+artifacts/
+submissions/*.csv
+*.joblib
+ref/
+report/*.aux
+report/*.log
+report/*.out
+report/report.pdf
