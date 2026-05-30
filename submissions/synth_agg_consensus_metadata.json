@@ -1,0 +1,36 @@
+{
+  "name": "agg_consensus",
+  "mechanism": "Start from 0.8248 anchor. Flip ONLY where all three aggressive candidates (Cand2 hos12_optimal, Cand3 hos12_promote, Cand5 spec_promote) agree on a non-anchor label AND row is mixed zone AND Cand3 supported by 0.8244 OR 0.8240. Most defensive aggressive candidate.",
+  "sources_used": [
+    "0.8248 anchor",
+    "Cand2",
+    "Cand3",
+    "Cand5",
+    "0.8244 anchor",
+    "0.8240 anchor"
+  ],
+  "n_flips_vs_anchor": 28,
+  "diff_vs_0.8248_anchor": 28,
+  "label_counts": {
+    "0": 2816,
+    "1": 3058,
+    "2": 183,
+    "3": 461,
+    "4": 74,
+    "5": 257
+  },
+  "hos12_estimate": {
+    "macro": 0.800627478418458,
+    "per_class": {
+      "0": 0.9831613253666486,
+      "1": 0.9229155742003147,
+      "2": 0.4418604651162791,
+      "3": 0.717948717948718,
+      "4": 0.8833333333333333,
+      "5": 0.8545454545454545
+    },
+    "note": "Tightest aggressive-consensus filter; same direction as S1 but more conservative"
+  },
+  "predicted_public": "0.8245-0.8268 (most conservative, max safety)",
+  "sha256": "54075fcb799ed7edd75068e84016a8ac9daf9b3c2efebe196268ccce5f13a10e"
+}

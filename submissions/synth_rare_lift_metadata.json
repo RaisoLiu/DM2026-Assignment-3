@@ -1,0 +1,35 @@
+{
+  "name": "rare_lift",
+  "mechanism": "Start from 0.8248 anchor. Flip TO c2 or c5 only, where Cand3 picks the rare class AND row is mixed zone AND Cand3 supported by 244/240/top3. Targets HOS-12 c2-F1 lift.",
+  "sources_used": [
+    "0.8248 anchor",
+    "Cand3",
+    "0.8244 anchor",
+    "0.8240 anchor",
+    "top3_vote"
+  ],
+  "n_flips_vs_anchor": 8,
+  "diff_vs_0.8248_anchor": 8,
+  "label_counts": {
+    "0": 2809,
+    "1": 3055,
+    "2": 190,
+    "3": 463,
+    "4": 73,
+    "5": 259
+  },
+  "hos12_estimate": {
+    "macro": 0.7964684317238276,
+    "per_class": {
+      "0": 0.9836601307189542,
+      "1": 0.9236479321314952,
+      "2": 0.43902439024390244,
+      "3": 0.693069306930693,
+      "4": 0.8925619834710744,
+      "5": 0.8468468468468469
+    },
+    "note": "OOF flip to c2/c5 wherever Cand3 picks; true S2 has tighter mixed+support filter on test"
+  },
+  "predicted_public": "0.8240-0.8270 (small flip count, HOS-12 lift focused on rare classes)",
+  "sha256": "463b9cde11b69361b4489009a77f88fa4876f4d2f51d99b9e7f0c45e741a0d3f"
+}

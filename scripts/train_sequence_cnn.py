@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,11 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.utils.class_weight import compute_class_weight
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from evaluate_aeon_rocket import make_representation
 
 
 SIGNAL_COLS = ["mean_x", "mean_y", "mean_z", "std_x", "std_y", "std_z"]
@@ -32,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.25)
     parser.add_argument("--channels", type=int, default=96)
+    parser.add_argument("--representation", choices=["raw", "augmented"], default="raw")
+    parser.add_argument("--sampler-mode", choices=["weighted", "shuffle"], default="weighted")
+    parser.add_argument("--class-weight-mode", choices=["balanced", "none"], default="balanced")
+    parser.add_argument("--focal-gamma", type=float, default=0.0)
     parser.add_argument("--max-folds", type=int, default=0, help="Debug: limit number of folds; 0 means all.")
     return parser.parse_args()
 
@@ -70,10 +80,10 @@ class ConvBlock(nn.Module):
 
 
 class SequenceCNN(nn.Module):
-    def __init__(self, channels: int, n_classes: int, dropout: float):
+    def __init__(self, in_channels: int, channels: int, n_classes: int, dropout: float):
         super().__init__()
         self.blocks = nn.Sequential(
-            ConvBlock(6, channels, 9, dropout),
+            ConvBlock(in_channels, channels, 9, dropout),
             nn.MaxPool1d(2),
             ConvBlock(channels, channels * 2, 7, dropout),
             nn.MaxPool1d(2),
@@ -101,10 +111,15 @@ def main() -> None:
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     x, y, users, file_ids = load_or_build_cache(args.data_dir, args.cache_dir)
+    x = make_representation(x.astype(np.float32), args.representation)
     classes = np.array(sorted(np.unique(y)))
     cv = StratifiedGroupKFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}; x={x.shape}; classes={classes.tolist()}; users={len(np.unique(users))}", flush=True)
+    print(
+        f"device={device}; representation={args.representation}; x={x.shape}; "
+        f"classes={classes.tolist()}; users={len(np.unique(users))}",
+        flush=True,
+    )
     oof = np.zeros((len(x), len(classes)), dtype=np.float32)
     fold_scores: list[float] = []
     splits = list(cv.split(x, y, users))
@@ -117,12 +132,15 @@ def main() -> None:
         std = x_tr.std(axis=(0, 2), keepdims=True) + 1e-6
         x_tr = (x_tr - mean) / std
         x_va = (x_va - mean) / std
-        model = SequenceCNN(args.channels, len(classes), args.dropout).to(device)
-        class_weights = compute_class_weight("balanced", classes=classes, y=y[tr])
-        criterion = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
+        model = SequenceCNN(x.shape[1], args.channels, len(classes), args.dropout).to(device)
+        weight_tensor = None
+        if args.class_weight_mode == "balanced":
+            class_weights = compute_class_weight("balanced", classes=classes, y=y[tr])
+            weight_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        criterion = FocalCrossEntropyLoss(weight=weight_tensor, gamma=args.focal_gamma)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-        train_loader = make_train_loader(x_tr, y[tr], args.batch_size)
+        train_loader = make_train_loader(x_tr, y[tr], args.batch_size, args.sampler_mode)
         valid_loader = DataLoader(SequenceDataset(x_va, y[va]), batch_size=args.batch_size * 2, shuffle=False, num_workers=2)
         best_score = -1.0
         best_state = None
@@ -166,12 +184,16 @@ def main() -> None:
     pd.DataFrame(
         {
             "model": ["sequence_cnn"],
+            "representation": [args.representation],
+            "sampler_mode": [args.sampler_mode],
+            "class_weight_mode": [args.class_weight_mode],
+            "focal_gamma": [args.focal_gamma],
             "base_macro_f1": [base_score],
             "fold_scores": [",".join(f"{s:.5f}" for s in fold_scores)],
         }
     ).to_csv(args.output_dir / "cv_metrics.csv", index=False)
     (args.output_dir / "metrics.json").write_text(
-        json.dumps({"base_macro_f1": base_score, "fold_scores": fold_scores}, indent=2),
+        json.dumps({"representation": args.representation, "base_macro_f1": base_score, "fold_scores": fold_scores}, indent=2),
         encoding="utf-8",
     )
 
@@ -217,7 +239,30 @@ def resample_to_300(arr: np.ndarray) -> np.ndarray:
     return np.vstack([np.interp(new, old, arr[:, i]) for i in range(arr.shape[1])]).T.astype(np.float32)
 
 
-def make_train_loader(x: np.ndarray, y: np.ndarray, batch_size: int) -> DataLoader:
+class FocalCrossEntropyLoss(nn.Module):
+    def __init__(self, weight: torch.Tensor | None = None, gamma: float = 0.0):
+        super().__init__()
+        self.register_buffer("weight", weight)
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        loss = nn.functional.cross_entropy(logits, target, weight=self.weight, reduction="none")
+        if self.gamma <= 0:
+            return loss.mean()
+        pt = torch.exp(-loss.detach()).clamp(1e-6, 1.0)
+        return (((1.0 - pt) ** self.gamma) * loss).mean()
+
+
+def make_train_loader(x: np.ndarray, y: np.ndarray, batch_size: int, sampler_mode: str) -> DataLoader:
+    if sampler_mode == "shuffle":
+        return DataLoader(
+            SequenceDataset(x, y),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            drop_last=False,
+        )
     class_counts = np.bincount(y)
     sample_weights = 1.0 / np.maximum(class_counts[y], 1)
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)

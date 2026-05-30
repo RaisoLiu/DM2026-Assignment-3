@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional comma-separated weights for the repeated inputs. If omitted, uses equal weights.",
     )
+    parser.add_argument("--alpha-grid", default="0.1,0.3,1.0,3.0")
+    parser.add_argument("--beta-grid", default="0.0,0.02,0.05,0.08,0.12,0.18,0.27,0.40,0.60,0.90,1.30")
+    parser.add_argument("--stay-grid", default="0.0")
+    parser.add_argument("--fine-class-weights", action="store_true")
+    parser.add_argument("--tune-viterbi-class-weights", action="store_true")
     return parser.parse_args()
 
 
@@ -40,10 +45,38 @@ def main() -> None:
     folds = pd.read_csv(args.folds_file)
 
     loaded = [load_named_npz(spec) for spec in args.input]
-    rows = [evaluate_one(name, payload, folds, args.output_dir) for name, payload in loaded]
+    alpha_grid = parse_float_grid(args.alpha_grid)
+    beta_grid = parse_float_grid(args.beta_grid)
+    stay_grid = parse_float_grid(args.stay_grid)
+    rows = [
+        evaluate_one(
+            name,
+            payload,
+            folds,
+            args.output_dir,
+            alpha_grid,
+            beta_grid,
+            stay_grid,
+            args.fine_class_weights,
+            args.tune_viterbi_class_weights,
+        )
+        for name, payload in loaded
+    ]
     if len(loaded) > 1:
         ensemble = make_ensemble_payload(loaded, args.ensemble_weights)
-        rows.append(evaluate_one("ensemble", ensemble, folds, args.output_dir))
+        rows.append(
+            evaluate_one(
+                "ensemble",
+                ensemble,
+                folds,
+                args.output_dir,
+                alpha_grid,
+                beta_grid,
+                stay_grid,
+                args.fine_class_weights,
+                args.tune_viterbi_class_weights,
+            )
+        )
 
     summary = pd.DataFrame(rows).sort_values("viterbi_macro_f1", ascending=False)
     summary.to_csv(args.output_dir / "summary.csv", index=False)
@@ -96,13 +129,30 @@ def parse_weights(raw_weights: str | None, n_items: int) -> np.ndarray:
     return weights / weights.sum()
 
 
+def parse_float_grid(raw: str) -> tuple[float, ...]:
+    values = tuple(float(part.strip()) for part in raw.split(",") if part.strip())
+    if not values:
+        raise ValueError("Grid must contain at least one value")
+    return values
+
+
 def assert_compatible(first: dict[str, np.ndarray], other: dict[str, np.ndarray]) -> None:
     for key in ("classes", "label", "file_id", "user_id"):
         if not np.array_equal(first[key], other[key]):
             raise ValueError(f"Cannot ensemble inputs with different {key}")
 
 
-def evaluate_one(name: str, payload: dict[str, np.ndarray], folds: pd.DataFrame, output_dir: Path) -> dict[str, object]:
+def evaluate_one(
+    name: str,
+    payload: dict[str, np.ndarray],
+    folds: pd.DataFrame,
+    output_dir: Path,
+    alpha_grid: tuple[float, ...],
+    beta_grid: tuple[float, ...],
+    stay_grid: tuple[float, ...],
+    fine_class_weights: bool,
+    tune_viterbi_class_weights: bool = False,
+) -> dict[str, object]:
     proba = payload["proba"]
     y = payload["label"]
     classes = payload["classes"]
@@ -122,6 +172,8 @@ def evaluate_one(name: str, payload: dict[str, np.ndarray], folds: pd.DataFrame,
 
         tuned = tune_probability_class_weights(proba[train_mask], y[train_mask], classes, n_passes=6)
         weights = tuned["weights"]
+        if fine_class_weights:
+            weights = fine_tune_class_weights(proba[train_mask], y[train_mask], classes, weights)
         fair_pred[valid_mask] = predict_from_weighted_proba(proba[valid_mask], classes, weights)
 
         best_params = tune_viterbi_params(
@@ -131,7 +183,33 @@ def evaluate_one(name: str, payload: dict[str, np.ndarray], folds: pd.DataFrame,
             file_ids=file_ids[train_mask],
             user_ids=user_ids[train_mask],
             class_weights=weights,
+            alpha_grid=alpha_grid,
+            beta_grid=beta_grid,
+            stay_grid=stay_grid,
         )
+        if tune_viterbi_class_weights:
+            weights = fine_tune_viterbi_class_weights(
+                proba=proba[train_mask],
+                y=y[train_mask],
+                classes=classes,
+                file_ids=file_ids[train_mask],
+                user_ids=user_ids[train_mask],
+                initial_weights=weights,
+                alpha=best_params["alpha"],
+                beta=best_params["beta"],
+                stay_bonus=best_params["stay_bonus"],
+            )
+            best_params = tune_viterbi_params(
+                proba=proba[train_mask],
+                y=y[train_mask],
+                classes=classes,
+                file_ids=file_ids[train_mask],
+                user_ids=user_ids[train_mask],
+                class_weights=weights,
+                alpha_grid=alpha_grid,
+                beta_grid=beta_grid,
+                stay_grid=stay_grid,
+            )
         transition, start = estimate_transition_model(
             y=y[train_mask],
             classes=classes,
@@ -148,11 +226,13 @@ def evaluate_one(name: str, payload: dict[str, np.ndarray], folds: pd.DataFrame,
             transition=transition,
             start=start,
             beta=best_params["beta"],
+            stay_bonus=best_params["stay_bonus"],
         )
         fold_params[str(int(fold))] = {
             "class_weights": [float(v) for v in weights],
             "alpha": float(best_params["alpha"]),
             "beta": float(best_params["beta"]),
+            "stay_bonus": float(best_params["stay_bonus"]),
             "train_macro_f1": float(best_params["train_macro_f1"]),
         }
 
@@ -181,6 +261,86 @@ def evaluate_one(name: str, payload: dict[str, np.ndarray], folds: pd.DataFrame,
     return result
 
 
+def fine_tune_class_weights(
+    proba: np.ndarray,
+    y: np.ndarray,
+    classes: np.ndarray,
+    initial_weights: np.ndarray,
+    n_passes: int = 6,
+) -> np.ndarray:
+    factors = np.exp(np.linspace(-0.18, 0.18, 73))
+    weights = initial_weights.astype(float).copy()
+    best_pred = predict_from_weighted_proba(proba, classes, weights)
+    best_score = float(f1_score(y, best_pred, average="macro"))
+    for _ in range(n_passes):
+        improved = False
+        for class_idx in (2, 5, 3, 1, 0, 4):
+            current = weights[class_idx]
+            local_best_score = best_score
+            local_best_weights = weights
+            for factor in factors:
+                trial = weights.copy()
+                trial[class_idx] = current * factor
+                trial = trial / np.exp(np.mean(np.log(trial + 1e-12)))
+                pred = predict_from_weighted_proba(proba, classes, trial)
+                score = float(f1_score(y, pred, average="macro"))
+                if score > local_best_score + 1e-12:
+                    local_best_score = score
+                    local_best_weights = trial
+            if local_best_score > best_score + 1e-12:
+                best_score = local_best_score
+                weights = local_best_weights
+                improved = True
+        if not improved:
+            break
+    return weights
+
+
+def fine_tune_viterbi_class_weights(
+    proba: np.ndarray,
+    y: np.ndarray,
+    classes: np.ndarray,
+    file_ids: np.ndarray,
+    user_ids: np.ndarray,
+    initial_weights: np.ndarray,
+    alpha: float,
+    beta: float,
+    stay_bonus: float,
+    n_passes: int = 4,
+) -> np.ndarray:
+    factors = np.exp(np.linspace(-0.16, 0.16, 65))
+    weights = initial_weights.astype(float).copy()
+    transition, start = estimate_transition_model(y, classes, file_ids, user_ids, alpha=alpha)
+    best_pred = viterbi_predict_by_user(
+        proba, classes, file_ids, user_ids, weights, transition, start, beta=beta, stay_bonus=stay_bonus
+    )
+    best_score = float(f1_score(y, best_pred, average="macro"))
+    for _ in range(n_passes):
+        improved = False
+        for class_idx in (2, 3, 5, 1, 0, 4):
+            current = weights[class_idx]
+            local_best_score = best_score
+            local_best_weights = weights
+            for factor in factors:
+                trial = weights.copy()
+                trial[class_idx] = current * factor
+                trial = trial / np.exp(np.mean(np.log(trial + 1e-12)))
+                pred = viterbi_predict_by_user(
+                    proba, classes, file_ids, user_ids, trial, transition, start, beta=beta, stay_bonus=stay_bonus
+                )
+                score = float(f1_score(y, pred, average="macro"))
+                if score > local_best_score + 1e-12:
+                    local_best_score = score
+                    local_best_weights = trial
+            if local_best_score > best_score + 1e-12:
+                best_score = local_best_score
+                weights = local_best_weights
+                improved = True
+        if not improved:
+            break
+    return weights
+
+
 def align_folds(file_ids: np.ndarray, folds: pd.DataFrame) -> np.ndarray:
     mapping = dict(zip(folds["file_id"], folds["fold"]))
     return np.array([mapping[int(fid)] for fid in file_ids], dtype=int)
@@ -193,18 +353,40 @@ def tune_viterbi_params(
     file_ids: np.ndarray,
     user_ids: np.ndarray,
     class_weights: np.ndarray,
+    alpha_grid: tuple[float, ...],
+    beta_grid: tuple[float, ...],
+    stay_grid: tuple[float, ...],
 ) -> dict[str, float]:
-    best = {"macro_f1": -np.inf, "alpha": 1.0, "beta": 0.0}
-    alpha_grid = (0.1, 0.3, 1.0, 3.0)
-    beta_grid = (0.0, 0.02, 0.05, 0.08, 0.12, 0.18, 0.27, 0.40, 0.60, 0.90, 1.30)
+    best = {"macro_f1": -np.inf, "alpha": 1.0, "beta": 0.0, "stay_bonus": 0.0}
     for alpha in alpha_grid:
         transition, start = estimate_transition_model(y, classes, file_ids, user_ids, alpha=alpha)
         for beta in beta_grid:
-            pred = viterbi_predict_by_user(proba, classes, file_ids, user_ids, class_weights, transition, start, beta=beta)
-            score = float(f1_score(y, pred, average="macro"))
-            if score > best["macro_f1"] + 1e-10:
-                best = {"macro_f1": score, "alpha": float(alpha), "beta": float(beta)}
-    return {"alpha": best["alpha"], "beta": best["beta"], "train_macro_f1": best["macro_f1"]}
+            for stay_bonus in stay_grid:
+                pred = viterbi_predict_by_user(
+                    proba,
+                    classes,
+                    file_ids,
+                    user_ids,
+                    class_weights,
+                    transition,
+                    start,
+                    beta=beta,
+                    stay_bonus=stay_bonus,
+                )
+                score = float(f1_score(y, pred, average="macro"))
+                if score > best["macro_f1"] + 1e-10:
+                    best = {
+                        "macro_f1": score,
+                        "alpha": float(alpha),
+                        "beta": float(beta),
+                        "stay_bonus": float(stay_bonus),
+                    }
+    return {
+        "alpha": best["alpha"],
+        "beta": best["beta"],
+        "stay_bonus": best["stay_bonus"],
+        "train_macro_f1": best["macro_f1"],
+    }
 
 
 def estimate_transition_model(
@@ -239,6 +421,7 @@ def viterbi_predict_by_user(
     transition: np.ndarray,
     start: np.ndarray,
     beta: float,
+    stay_bonus: float = 0.0,
 ) -> np.ndarray:
     pred = np.empty(len(file_ids), dtype=int)
     log_transition = np.log(np.clip(transition, 1e-12, 1.0))
@@ -246,7 +429,7 @@ def viterbi_predict_by_user(
     weighted = np.clip(proba * class_weights.reshape(1, -1), 1e-12, None)
     log_emission = np.log(weighted)
     for _, idx in sequence_indices(file_ids, user_ids):
-        path = viterbi_path(log_emission[idx], log_start, log_transition, beta=beta)
+        path = viterbi_path(log_emission[idx], log_start, log_transition, beta=beta, stay_bonus=stay_bonus)
         pred[idx] = classes[path]
     return pred
 
@@ -257,12 +440,18 @@ def sequence_indices(file_ids: np.ndarray, user_ids: np.ndarray):
         yield user_id, group["row"].to_numpy(dtype=int)
 
 
-def viterbi_path(log_emission: np.ndarray, log_start: np.ndarray, log_transition: np.ndarray, beta: float) -> np.ndarray:
+def viterbi_path(
+    log_emission: np.ndarray,
+    log_start: np.ndarray,
+    log_transition: np.ndarray,
+    beta: float,
+    stay_bonus: float = 0.0,
+) -> np.ndarray:
     n_steps, n_classes = log_emission.shape
     scores = np.empty((n_steps, n_classes), dtype=float)
     back = np.zeros((n_steps, n_classes), dtype=np.int16)
     scores[0] = log_start + log_emission[0]
-    transition_score = beta * log_transition
+    transition_score = beta * log_transition + stay_bonus * np.eye(n_classes)
     for t in range(1, n_steps):
         candidates = scores[t - 1][:, None] + transition_score
         back[t] = np.argmax(candidates, axis=0)

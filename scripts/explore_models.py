@@ -45,9 +45,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--folds-file", type=Path, default=None)
     parser.add_argument("--sample-weight-mode", choices=["balanced", "none"], default="balanced")
     parser.add_argument(
+        "--class-weight-multipliers",
+        default=None,
+        help="Optional comma-separated class=multiplier values applied on top of sample weights, e.g. 2=1.8,5=1.3.",
+    )
+    parser.add_argument(
         "--context",
         default="base",
-        choices=["base", "position", "rolling", "position_rolling", "user_norm", "position_user_norm"],
+        choices=[
+            "base",
+            "position",
+            "rolling",
+            "position_rolling",
+            "shift",
+            "position_shift",
+            "shift_wide",
+            "position_shift_wide",
+            "user_norm",
+            "position_user_norm",
+        ],
     )
     parser.add_argument("--models", default="hgb_fast,lgbm_base")
     return parser.parse_args()
@@ -64,6 +80,7 @@ def main() -> None:
     groups = frame["user_id"].astype(str).to_numpy()
     classes = np.array(sorted(np.unique(y)))
     fold_ids = load_fold_ids(frame, args.folds_file)
+    class_weight_multipliers = parse_class_weight_multipliers(args.class_weight_multipliers)
     if fold_ids is None:
         fold_ids = make_default_fold_ids(X, y, groups, n_splits=args.n_splits, seed=args.seed)
     print(f"context={args.context}; X={X.shape}; users={len(np.unique(groups))}; classes={classes.tolist()}", flush=True)
@@ -85,6 +102,7 @@ def main() -> None:
             seed=args.seed,
             fold_ids=fold_ids,
             sample_weight_mode=args.sample_weight_mode,
+            class_weight_multipliers=class_weight_multipliers,
         )
         results.append(result)
         pd.DataFrame(
@@ -115,10 +133,12 @@ def main() -> None:
 
 def add_context_features(frame: pd.DataFrame, context: str) -> pd.DataFrame:
     frame = frame.sort_values(["user_id", "file_id"]).reset_index(drop=True).copy()
-    if context in {"position", "position_rolling"}:
+    if context in {"position", "position_rolling", "position_shift", "position_shift_wide"}:
         add_position_features(frame)
     if context == "position_user_norm":
         add_position_features(frame)
+    if context in {"shift", "position_shift", "shift_wide", "position_shift_wide"}:
+        frame = add_shift_features(frame, wide=context.endswith("_wide"))
     if context in {"user_norm", "position_user_norm"}:
         frame = add_user_norm_features(frame)
     if context in {"rolling", "position_rolling"}:
@@ -136,6 +156,49 @@ def add_context_features(frame: pd.DataFrame, context: str) -> pd.DataFrame:
                 additions[f"{col}_roll{window}_user_delta"] = frame[col] - roll
         frame = pd.concat([frame, pd.DataFrame(additions, index=frame.index)], axis=1)
     return frame.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def add_shift_features(frame: pd.DataFrame, wide: bool = False) -> pd.DataFrame:
+    base_cols = choose_shift_base_columns(frame, wide=wide)
+    additions = {}
+    grouped = frame.groupby("user_id", sort=False)
+    for col in base_cols:
+        series = frame[col]
+        for offset in (1, 2):
+            prev = grouped[col].shift(offset)
+            next_ = grouped[col].shift(-offset)
+            additions[f"{col}_prev{offset}"] = prev.fillna(series)
+            additions[f"{col}_next{offset}"] = next_.fillna(series)
+            additions[f"{col}_prev{offset}_delta"] = (series - prev).fillna(0.0)
+            additions[f"{col}_next{offset}_delta"] = (next_ - series).fillna(0.0)
+        for window in (3, 5, 9):
+            roll = grouped[col].transform(lambda s: s.rolling(window, center=True, min_periods=1).mean())
+            additions[f"{col}_shift_roll{window}_mean"] = roll
+            additions[f"{col}_shift_roll{window}_delta"] = series - roll
+    if not additions:
+        return frame
+    return pd.concat([frame, pd.DataFrame(additions, index=frame.index)], axis=1)
+
+
+def choose_shift_base_columns(frame: pd.DataFrame, wide: bool) -> list[str]:
+    priority_tokens = (
+        "mean_vm",
+        "std_vm",
+        "gravity_abs_delta",
+        "mean_x",
+        "mean_y",
+        "mean_z",
+        "std_x",
+        "std_y",
+        "std_z",
+        "orient_",
+        "corr_mean_",
+        "dynamic_to_static",
+    )
+    if wide:
+        cols = [c for c in frame.columns if c not in META_COLS and c.startswith(priority_tokens)]
+        return cols[:180]
+    return choose_context_base_columns(frame)[:80]
 
 
 def load_fold_ids(frame: pd.DataFrame, folds_file: Path | None) -> np.ndarray | None:
@@ -157,6 +220,16 @@ def make_default_fold_ids(X: pd.DataFrame, y: np.ndarray, groups: np.ndarray, n_
     if np.any(fold_ids < 1):
         raise RuntimeError("Some rows were not assigned to a fold")
     return fold_ids
+
+
+def parse_class_weight_multipliers(raw: str | None) -> dict[int, float]:
+    if not raw:
+        return {}
+    values: dict[int, float] = {}
+    for part in [p.strip() for p in raw.split(",") if p.strip()]:
+        key, value = part.split("=", 1)
+        values[int(key.strip())] = float(value.strip())
+    return values
 
 
 def add_position_features(frame: pd.DataFrame) -> None:
@@ -328,6 +401,51 @@ def make_models(seed: int) -> dict[str, object]:
                     n_jobs=-1,
                     verbosity=-1,
                 ),
+                "lgbm_leaves47": LGBMClassifier(
+                    objective="multiclass",
+                    num_class=6,
+                    n_estimators=1000,
+                    learning_rate=0.018,
+                    num_leaves=47,
+                    min_child_samples=16,
+                    subsample=0.88,
+                    colsample_bytree=0.80,
+                    reg_alpha=0.04,
+                    reg_lambda=0.30,
+                    random_state=seed + 12,
+                    n_jobs=-1,
+                    verbosity=-1,
+                ),
+                "lgbm_leaves63_long": LGBMClassifier(
+                    objective="multiclass",
+                    num_class=6,
+                    n_estimators=1250,
+                    learning_rate=0.015,
+                    num_leaves=63,
+                    min_child_samples=10,
+                    subsample=0.88,
+                    colsample_bytree=0.72,
+                    reg_alpha=0.05,
+                    reg_lambda=0.35,
+                    random_state=seed + 13,
+                    n_jobs=-1,
+                    verbosity=-1,
+                ),
+                "lgbm_reg31": LGBMClassifier(
+                    objective="multiclass",
+                    num_class=6,
+                    n_estimators=1100,
+                    learning_rate=0.02,
+                    num_leaves=31,
+                    min_child_samples=28,
+                    subsample=0.92,
+                    colsample_bytree=0.88,
+                    reg_alpha=0.08,
+                    reg_lambda=0.55,
+                    random_state=seed + 14,
+                    n_jobs=-1,
+                    verbosity=-1,
+                ),
             }
         )
     except Exception as exc:
@@ -350,6 +468,72 @@ def make_models(seed: int) -> dict[str, object]:
             n_jobs=-1,
             eval_metric="mlogloss",
             tree_method="hist",
+        )
+        models["xgb_depth4"] = XGBClassifier(
+            objective="multi:softprob",
+            num_class=6,
+            n_estimators=650,
+            learning_rate=0.025,
+            max_depth=4,
+            min_child_weight=2.5,
+            subsample=0.92,
+            colsample_bytree=0.88,
+            reg_alpha=0.04,
+            reg_lambda=0.35,
+            random_state=seed + 21,
+            n_jobs=-1,
+            eval_metric="mlogloss",
+            tree_method="hist",
+        )
+        models["xgb_depth6"] = XGBClassifier(
+            objective="multi:softprob",
+            num_class=6,
+            n_estimators=420,
+            learning_rate=0.03,
+            max_depth=6,
+            min_child_weight=2.0,
+            subsample=0.88,
+            colsample_bytree=0.80,
+            reg_alpha=0.03,
+            reg_lambda=0.30,
+            random_state=seed + 22,
+            n_jobs=-1,
+            eval_metric="mlogloss",
+            tree_method="hist",
+        )
+        models["xgb_gpu_depth4"] = XGBClassifier(
+            objective="multi:softprob",
+            num_class=6,
+            n_estimators=900,
+            learning_rate=0.02,
+            max_depth=4,
+            min_child_weight=2.0,
+            subsample=0.9,
+            colsample_bytree=0.82,
+            reg_alpha=0.05,
+            reg_lambda=0.35,
+            random_state=seed + 23,
+            n_jobs=-1,
+            eval_metric="mlogloss",
+            tree_method="hist",
+            device="cuda",
+        )
+        models["xgb_gpu_depth5"] = XGBClassifier(
+            objective="multi:softprob",
+            num_class=6,
+            n_estimators=650,
+            learning_rate=0.025,
+            max_depth=5,
+            min_child_weight=2.0,
+            subsample=0.9,
+            colsample_bytree=0.82,
+            reg_alpha=0.04,
+            reg_lambda=0.30,
+            random_state=seed + 24,
+            n_jobs=-1,
+            eval_metric="mlogloss",
+            tree_method="hist",
+            device="cuda",
         )
     except Exception as exc:
         print(f"XGBoost unavailable: {exc}", flush=True)
@@ -418,6 +602,7 @@ def run_cv(
     seed: int,
     fold_ids: np.ndarray,
     sample_weight_mode: str,
+    class_weight_multipliers: dict[int, float],
 ):
     oof = np.zeros((len(X), len(classes)), dtype=float)
     fold_scores: list[float] = []
@@ -428,6 +613,9 @@ def run_cv(
         sample_weight = None
         if sample_weight_mode == "balanced":
             sample_weight = compute_sample_weight("balanced", y[tr])
+        if class_weight_multipliers:
+            extra = np.array([class_weight_multipliers.get(int(label), 1.0) for label in y[tr]], dtype=float)
+            sample_weight = extra if sample_weight is None else sample_weight * extra
         fit_model(m, X.iloc[tr], y[tr], sample_weight)
         proba = aligned_proba(m, X.iloc[va], classes)
         oof[va] = proba

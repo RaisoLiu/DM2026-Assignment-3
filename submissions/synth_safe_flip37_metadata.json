@@ -1,0 +1,35 @@
+{
+  "name": "safe_flip37",
+  "mechanism": "Start from 0.8248 anchor. Flip to Cand3 (5src HOS-12-optimal promote, HOS=0.7954) where (a) row is mixed zone (anchor trio not unanimous) AND (b) Cand3 agrees with at least one of {0.8244, 0.8240, top3_vote}. Zero unanim_override by construction.",
+  "sources_used": [
+    "0.8248 anchor",
+    "Cand3 (5src_hos12_promote)",
+    "0.8244 anchor",
+    "0.8240 anchor",
+    "top3_vote"
+  ],
+  "n_flips_vs_anchor": 37,
+  "diff_vs_0.8248_anchor": 37,
+  "label_counts": {
+    "0": 2816,
+    "1": 3063,
+    "2": 182,
+    "3": 456,
+    "4": 74,
+    "5": 258
+  },
+  "hos12_estimate": {
+    "macro": 0.800627478418458,
+    "per_class": {
+      "0": 0.9831613253666486,
+      "1": 0.9229155742003147,
+      "2": 0.4418604651162791,
+      "3": 0.717948717948718,
+      "4": 0.8833333333333333,
+      "5": 0.8545454545454545
+    },
+    "note": "max-replace upper bound proxy on OOF; true S1 HOS-12 likely in [0.7779, 0.8006]"
+  },
+  "predicted_public": "0.8235-0.8265 (37 flips with 244/240/top3 support; HOS-12 lift)",
+  "sha256": "9921d49d9b72d6cd0c1943ca4332edcd8609df7fdbbef8cd6b7a9cca675d086a"
+}
