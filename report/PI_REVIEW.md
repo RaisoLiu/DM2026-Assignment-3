@@ -37,3 +37,18 @@ leaderboard.
 5. Any AI assistance should be acknowledged according to the course policy, and
    no copied code or prose should appear in the final submission.
 
+## Final PI-Style Audit Notes
+
+- The final report now explains why the selected model is not the highest-OOF
+  model: XGBoost and blend probes had higher or competitive OOF scores but lower
+  public scores, so the final choice is justified through grouped CV, public
+  evidence, and test-prior sanity checks together.
+- Negative controls are explicitly reported: round-2 LGBM/XGBoost
+  hyperparameter variants, temporal-shape feature expansion, and two submitted
+  blend probes did not beat the selected LightGBM model.
+- The label-2 weakness is not hidden. The report names label 2 as the dominant
+  residual risk, reports its OOF F1, and describes why aggressive class-2 priors
+  were rejected after public-score probes.
+- The reproducibility chain is complete: final CSV path, SHA-256, seed, feature
+  context, calibration source, submission log, and PDF build procedure are all
+  documented.
